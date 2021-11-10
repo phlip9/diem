@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    diemnet::state::PeerStates, DiemDataClient, Error, GlobalDataSummary, Response,
-    ResponseCallback, ResponseContext, ResponseError, ResponseId, Result,
+    diemnet::state::{ErrorType, PeerStates},
+    DiemDataClient, Error, GlobalDataSummary, Response, ResponseCallback, ResponseContext,
+    ResponseError, ResponseId, Result,
 };
 use async_trait::async_trait;
 use diem_config::network_id::PeerNetworkId;
@@ -196,26 +197,20 @@ impl DiemNetDataClient {
             .send_request(peer, request.clone(), DEFAULT_TIMEOUT)
             .await;
 
-        // convert network error and storage service error types into data client
-        // errors.
-        let result = result.map_err(|err| match err {
-            storage_service_client::Error::RpcError(err) => match err {
-                RpcError::NotConnected(_) => Error::DataIsUnavailable(err.to_string()),
-                RpcError::TimedOut => Error::TimeoutWaitingForResponse(err.to_string()),
-                _ => Error::UnexpectedErrorEncountered(err.to_string()),
-            },
-            storage_service_client::Error::StorageServiceError(err) => {
-                Error::UnexpectedErrorEncountered(err.to_string())
-            }
-        });
-
         match result {
             Ok(response) => {
-                let data_client = self.clone();
+                // For now, record all responses that at least pass the data
+                // client layer successfully. An alternative might also have the
+                // consumer notify both success and failure via the callback.
+                // On the one hand, scoring dynamics are simpler when each request
+                // is successful or failed but not both; on the other hand, this
+                // feels simpler for the consumer.
+                self.peer_states.write().update_score_success(peer);
+
                 // package up all of the context needed to fully report an error
                 // with this RPC.
                 let response_callback = DiemNetResponseCallback {
-                    data_client,
+                    data_client: self.clone(),
                     id,
                     peer,
                     request,
@@ -227,10 +222,32 @@ impl DiemNetDataClient {
                 Ok(Response::new(context, response))
             }
             Err(err) => {
-                // TODO(philiphayes): convert `err` into `ResponseError`
-                let error_type = ResponseError::InvalidData;
-                self.notify_bad_response(id, peer, &request, error_type);
-                Err(err)
+                // convert network error and storage service error types into
+                // data client errors. also categorize the error type for scoring
+                // purposes.
+                let (client_err, err_type) = match err {
+                    storage_service_client::Error::RpcError(err) => match err {
+                        RpcError::NotConnected(_) => (
+                            Error::DataIsUnavailable(err.to_string()),
+                            ErrorType::NotUseful,
+                        ),
+                        RpcError::TimedOut => (
+                            Error::TimeoutWaitingForResponse(err.to_string()),
+                            ErrorType::NotUseful,
+                        ),
+                        _ => (
+                            Error::UnexpectedErrorEncountered(err.to_string()),
+                            ErrorType::NotUseful,
+                        ),
+                    },
+                    storage_service_client::Error::StorageServiceError(err) => (
+                        Error::UnexpectedErrorEncountered(err.to_string()),
+                        ErrorType::NotUseful,
+                    ),
+                };
+
+                self.notify_bad_response(id, peer, &request, err_type);
+                Err(client_err)
             }
         }
     }
@@ -238,11 +255,13 @@ impl DiemNetDataClient {
     fn notify_bad_response(
         &self,
         _id: ResponseId,
-        _peer: PeerNetworkId,
+        peer: PeerNetworkId,
         _request: &StorageServiceRequest,
-        _error: ResponseError,
+        error_type: ErrorType,
     ) {
-        // TODO(philiphayes): update peer score
+        self.peer_states
+            .write()
+            .update_score_error(peer, error_type);
     }
 }
 
@@ -331,8 +350,9 @@ struct DiemNetResponseCallback {
 
 impl ResponseCallback for DiemNetResponseCallback {
     fn notify_bad_response(&self, error: ResponseError) {
+        let error_type = ErrorType::from(error);
         self.data_client
-            .notify_bad_response(self.id, self.peer, &self.request, error);
+            .notify_bad_response(self.id, self.peer, &self.request, error_type);
     }
 }
 
