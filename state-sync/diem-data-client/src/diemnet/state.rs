@@ -16,6 +16,8 @@ const SUCCESSFUL_RESPONSE_DELTA: f64 = 1.0;
 const NOT_USEFUL_MULTIPLIER: f64 = 0.95;
 /// Likely to be a malicious response.
 const MALICIOUS_MULTIPLIER: f64 = 0.8;
+/// Ignore a peer when their score dips below this threshold.
+const IGNORE_PEER_THRESHOLD: f64 = 25.0;
 
 pub(crate) enum ErrorType {
     /// A response or error that's not actively malicious but also doesn't help
@@ -62,6 +64,14 @@ impl Default for PeerState {
 }
 
 impl PeerState {
+    fn storage_summary_if_not_terrible_score(&self) -> Option<&StorageServerSummary> {
+        if self.score <= IGNORE_PEER_THRESHOLD {
+            None
+        } else {
+            self.storage_summary.as_ref()
+        }
+    }
+
     fn update_score_success(&mut self) {
         self.score = f64::min(self.score + SUCCESSFUL_RESPONSE_DELTA, MAX_SCORE);
     }
@@ -77,6 +87,7 @@ impl PeerState {
 
 /// Contains all of the unbanned peers' most recent [`StorageServerSummary`] data
 /// advertisements and data-client internal metadata for scoring.
+// TODO(philiphayes): this map needs to be garbage collected
 #[derive(Debug)]
 pub(crate) struct PeerStates {
     inner: HashMap<PeerNetworkId, PeerState>,
@@ -103,9 +114,13 @@ impl PeerStates {
             return true;
         }
 
+        // TODO(philiphayes): does it make sense to not even consider low score
+        // peers as targets for non-summary requests? a low score will only recover
+        // when we send enough summary requests via the poller. i guess that
+        // doubles as a convenient unbanning mechanism?
         self.inner
             .get(peer)
-            .and_then(|peer_state| peer_state.storage_summary.as_ref())
+            .and_then(PeerState::storage_summary_if_not_terrible_score)
             .map(|summary| summary.can_service(request))
             .unwrap_or(false)
     }
@@ -133,10 +148,11 @@ impl PeerStates {
         let mut max_transaction_output_chunk_sizes = vec![];
         let mut max_account_states_chunk_sizes = vec![];
 
+        // only include likely-not-malicious peers in the data summary aggregation.
         let summaries = self
             .inner
             .values()
-            .filter_map(|state| state.storage_summary.as_ref());
+            .filter_map(PeerState::storage_summary_if_not_terrible_score);
 
         // collect each peer's protocol and data advertisements
         for summary in summaries {
