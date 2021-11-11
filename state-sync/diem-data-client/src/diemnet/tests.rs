@@ -246,7 +246,7 @@ async fn bad_peer_is_eventually_banned_internal() {
                 )));
             } else if peer == bad_peer.peer_id() {
                 // bad peer responds with error
-                response_sender.send(Err(StorageServiceError::InternalError));
+                response_sender.send(Err(StorageServiceError::InternalError("".to_string())));
             }
         }
     });
