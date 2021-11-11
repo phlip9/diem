@@ -23,6 +23,9 @@ use proptest::{
 use serde::{de, Deserialize, Serialize};
 use thiserror::Error;
 
+/// A type alias for different epochs.
+pub type Epoch = u64;
+
 pub type Result<T, E = StorageServiceError> = ::std::result::Result<T, E>;
 
 /// A storage service error that can be returned to the client on a failure
@@ -258,14 +261,61 @@ pub struct ProtocolMetadata {
 }
 
 impl ProtocolMetadata {
-    pub fn can_service(&self, _request: &StorageServiceRequest) -> bool {
-        // TODO(philiphayes): fill out
-        true
+    pub fn can_service(&self, request: &StorageServiceRequest) -> bool {
+        use StorageServiceRequest::*;
+        match request {
+            GetServerProtocolVersion => true,
+            GetStorageServerSummary => true,
+            GetNumberOfAccountsAtVersion(_) => true,
+            GetAccountStatesChunkWithProof(request) => {
+                let chunk_size = match CompleteDataRange::new(
+                    request.start_account_index,
+                    request.end_account_index,
+                ) {
+                    Ok(range) => range.len(),
+                    Err(_) => return false,
+                };
+                self.max_account_states_chunk_size >= chunk_size
+            }
+            GetEpochEndingLedgerInfos(request) => {
+                let chunk_size =
+                    match CompleteDataRange::new(request.start_epoch, request.expected_end_epoch) {
+                        Ok(range) => range.len(),
+                        Err(_) => return false,
+                    };
+                self.max_epoch_chunk_size >= chunk_size
+            }
+            GetTransactionOutputsWithProof(request) => {
+                let chunk_size =
+                    match CompleteDataRange::new(request.start_version, request.end_version) {
+                        Ok(range) => range.len(),
+                        Err(_) => return false,
+                    };
+                self.max_transaction_output_chunk_size >= chunk_size
+            }
+            GetTransactionsWithProof(request) => {
+                let chunk_size =
+                    match CompleteDataRange::new(request.start_version, request.end_version) {
+                        Ok(range) => range.len(),
+                        Err(_) => return false,
+                    };
+                self.max_transaction_chunk_size >= chunk_size
+            }
+        }
     }
 }
 
-/// A type alias for different epochs.
-pub type Epoch = u64;
+// TODO(philiphayes): default constants in diem-config?
+impl Default for ProtocolMetadata {
+    fn default() -> Self {
+        Self {
+            max_epoch_chunk_size: 1000,
+            max_transaction_chunk_size: 1000,
+            max_transaction_output_chunk_size: 1000,
+            max_account_states_chunk_size: 1000,
+        }
+    }
+}
 
 /// A summary of the data actually held by the storage service instance.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -617,6 +667,21 @@ mod tests {
         assert!(!summary.can_service(&get_txns_request(300, 150, 150)));
         assert!(!summary.can_service(&get_txns_request(300, 200, 200)));
         assert!(!summary.can_service(&get_txns_request(251, 200, 200)));
+    }
+
+    #[test]
+    fn test_protocol_metadata_can_service() {
+        let metadata = ProtocolMetadata {
+            max_transaction_chunk_size: 100,
+            max_epoch_chunk_size: 100,
+            ..Default::default()
+        };
+
+        assert!(metadata.can_service(&get_txns_request(200, 100, 199)));
+        assert!(!metadata.can_service(&get_txns_request(200, 100, 200)));
+
+        assert!(metadata.can_service(&get_epochs_request(100, 199)));
+        assert!(!metadata.can_service(&get_epochs_request(100, 200)));
     }
 
     proptest! {
