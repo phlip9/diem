@@ -122,10 +122,10 @@ async fn test_get_storage_server_summary() {
                 highest_epoch,
                 highest_version,
             )),
-            epoch_ending_ledger_infos: Some(CompleteDataRange::from_genesis(highest_epoch - 1)),
-            transactions: Some(CompleteDataRange::from_genesis(highest_version)),
-            transaction_outputs: Some(CompleteDataRange::from_genesis(highest_version)),
-            account_states: Some(CompleteDataRange::from_genesis(highest_version)),
+            epoch_ending_ledger_infos: Some(CompleteDataRange::new(0, highest_epoch - 1).unwrap()),
+            transactions: Some(CompleteDataRange::new(0, highest_version).unwrap()),
+            transaction_outputs: Some(CompleteDataRange::new(0, highest_version).unwrap()),
+            account_states: Some(CompleteDataRange::new(0, highest_version).unwrap()),
         },
     };
     assert_eq!(
