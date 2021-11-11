@@ -15,6 +15,11 @@ use diem_types::{
     },
 };
 use num_traits::int::PrimInt;
+#[cfg(test)]
+use proptest::{
+    arbitrary::{any, Arbitrary},
+    strategy::{BoxedStrategy, Strategy},
+};
 use serde::{de, Deserialize, Serialize};
 use thiserror::Error;
 
@@ -367,7 +372,7 @@ impl DataSummary {
 }
 
 #[derive(Clone, Debug, Error)]
-#[error("data range cannot be degenerate (lowest > highest)")]
+#[error("data range cannot be degenerate")]
 pub struct DegenerateRangeError;
 
 /// A struct representing a contiguous, non-empty data range (lowest to highest,
@@ -376,27 +381,31 @@ pub struct DegenerateRangeError;
 /// This is used to provide a summary of the data currently held in storage, e.g.
 /// a CompleteDataRange<Version> of (A,B) means all versions A->B (inclusive).
 ///
-/// Note: CompleteDataRanges are never degenerate (lowest > highest). Constructing
-/// a degenerate range via `new` will return an `Err`.
+/// Note: `CompleteDataRanges` are never degenerate (lowest > highest) and the
+/// range length is always expressible without overlowing. Constructing a
+/// degenerate range via `new` will return an `Err`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompleteDataRange<T> {
     lowest: T,
     highest: T,
 }
 
+fn range_length_checked<T: PrimInt>(lowest: T, highest: T) -> Result<T, DegenerateRangeError> {
+    // len = highest - lowest + 1
+    // Note: the order of operations here is important; we need to subtract first
+    // before we (+1) to ensure we don't underflow when highest == lowest.
+    highest
+        .checked_sub(&lowest)
+        .and_then(|value| value.checked_add(&T::one()))
+        .ok_or(DegenerateRangeError)
+}
+
 impl<T: PrimInt> CompleteDataRange<T> {
     pub fn new(lowest: T, highest: T) -> Result<Self, DegenerateRangeError> {
-        if lowest <= highest {
-            Ok(Self { lowest, highest })
-        } else {
+        if lowest > highest || range_length_checked(lowest, highest).is_err() {
             Err(DegenerateRangeError)
-        }
-    }
-
-    pub fn from_genesis(highest: T) -> Self {
-        Self {
-            lowest: T::zero(),
-            highest,
+        } else {
+            Ok(Self { lowest, highest })
         }
     }
 
@@ -419,6 +428,17 @@ impl<T: PrimInt> CompleteDataRange<T> {
     #[inline]
     pub fn highest(&self) -> T {
         self.highest
+    }
+
+    /// Returns the length of the data range.
+    ///
+    /// Note that `CompleteDataRange` maintains the invariant that the range
+    /// length is always expressible without overflow, so this method is
+    /// infallible.
+    #[inline]
+    pub fn len(&self) -> T {
+        debug_assert!(range_length_checked(self.lowest, self.highest).is_ok());
+        (self.highest - self.lowest) + T::one()
     }
 
     /// Returns true iff the given item is within this range
@@ -455,10 +475,29 @@ where
 }
 
 #[cfg(test)]
+impl<T> Arbitrary for CompleteDataRange<T>
+where
+    T: PrimInt + Arbitrary + 'static,
+{
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (any::<T>(), any::<T>())
+            .prop_filter_map("degenerate range", |(lowest, highest)| {
+                CompleteDataRange::new(lowest, highest).ok()
+            })
+            .boxed()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use claim::{assert_err, assert_ok};
     use diem_crypto::hash::HashValue;
     use diem_types::{block_info::BlockInfo, ledger_info::LedgerInfo};
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
 
     fn mock_ledger_info(version: Version) -> LedgerInfoWithSignatures {
@@ -497,6 +536,26 @@ mod tests {
             end_version: end,
             include_events: true,
         })
+    }
+
+    #[test]
+    fn test_complete_data_range() {
+        // good ranges
+        assert_ok!(CompleteDataRange::new(0, 0));
+        assert_ok!(CompleteDataRange::new(10, 10));
+        assert_ok!(CompleteDataRange::new(10, 20));
+        assert_ok!(CompleteDataRange::new(u64::MAX, u64::MAX));
+
+        // degenerate ranges
+        assert_err!(CompleteDataRange::new(1, 0));
+        assert_err!(CompleteDataRange::new(20, 10));
+        assert_err!(CompleteDataRange::new(u64::MAX, 0));
+        assert_err!(CompleteDataRange::new(u64::MAX, 1));
+
+        // range length overflow edge case
+        assert_ok!(CompleteDataRange::new(1, u64::MAX));
+        assert_ok!(CompleteDataRange::new(0, u64::MAX - 1));
+        assert_err!(CompleteDataRange::new(0, u64::MAX));
     }
 
     #[test]
@@ -558,5 +617,15 @@ mod tests {
         assert!(!summary.can_service(&get_txns_request(300, 150, 150)));
         assert!(!summary.can_service(&get_txns_request(300, 200, 200)));
         assert!(!summary.can_service(&get_txns_request(251, 200, 200)));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn test_data_summary_length_invariant(range in any::<CompleteDataRange<u64>>()) {
+            // should not panic
+            let _ = range.len();
+        }
     }
 }

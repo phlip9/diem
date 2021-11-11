@@ -7,8 +7,14 @@ use super::{
 use channel::{diem_channel, message_queues::QueueStyle};
 use claim::assert_matches;
 use diem_config::network_id::{NetworkId, PeerNetworkId};
+use diem_crypto::HashValue;
 use diem_time_service::{MockTimeService, TimeService};
-use diem_types::{transaction::TransactionListWithProof, PeerId};
+use diem_types::{
+    block_info::BlockInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    transaction::{TransactionListWithProof, Version},
+    PeerId,
+};
 use futures::StreamExt;
 use maplit::hashmap;
 use network::{
@@ -17,13 +23,50 @@ use network::{
     protocols::{network::NewNetworkSender, wire::handshake::v1::ProtocolId},
     transport::ConnectionMetadata,
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use storage_service_client::{StorageServiceClient, StorageServiceNetworkSender};
 use storage_service_server::network::{NetworkRequest, ResponseSender};
 use storage_service_types::{
-    CompleteDataRange, DataSummary, ProtocolMetadata, StorageServerSummary, StorageServiceMessage,
-    StorageServiceRequest, StorageServiceResponse, TransactionsWithProofRequest,
+    CompleteDataRange, DataSummary, ProtocolMetadata, StorageServerSummary, StorageServiceError,
+    StorageServiceMessage, StorageServiceRequest, StorageServiceResponse,
+    TransactionsWithProofRequest,
 };
+
+fn mock_ledger_info(version: Version) -> LedgerInfoWithSignatures {
+    LedgerInfoWithSignatures::new(
+        LedgerInfo::new(
+            BlockInfo::new(
+                0,                 /* epoch */
+                0,                 /* round */
+                HashValue::zero(), /* id */
+                HashValue::zero(), /* executed_state_id */
+                version,           /* version */
+                0,                 /* timestamp_usecs */
+                None,              /* next_epoch_state */
+            ),
+            HashValue::zero(),
+        ),
+        BTreeMap::new(),
+    )
+}
+
+fn mock_storage_summary(version: Version) -> StorageServerSummary {
+    StorageServerSummary {
+        protocol_metadata: ProtocolMetadata {
+            max_epoch_chunk_size: 1000,
+            max_transaction_chunk_size: 1000,
+            max_transaction_output_chunk_size: 1000,
+            max_account_states_chunk_size: 1000,
+        },
+        data_summary: DataSummary {
+            synced_ledger_info: Some(mock_ledger_info(version)),
+            epoch_ending_ledger_infos: None,
+            transactions: Some(CompleteDataRange::new(0, version).unwrap()),
+            transaction_outputs: None,
+            account_states: None,
+        },
+    }
+}
 
 struct MockNetwork {
     peer_mgr_reqs_rx: diem_channel::Receiver<(PeerId, ProtocolId), PeerManagerRequest>,
@@ -128,21 +171,7 @@ async fn test_request_works_only_when_data_available() {
     assert_eq!(protocol, ProtocolId::StorageServiceRpc);
     assert_matches!(request, StorageServiceRequest::GetStorageServerSummary);
 
-    let summary = StorageServerSummary {
-        protocol_metadata: ProtocolMetadata {
-            max_epoch_chunk_size: 1000,
-            max_transaction_chunk_size: 1000,
-            max_transaction_output_chunk_size: 1000,
-            max_account_states_chunk_size: 1000,
-        },
-        data_summary: DataSummary {
-            synced_ledger_info: None,
-            epoch_ending_ledger_infos: None,
-            transactions: Some(CompleteDataRange::from_genesis(200)),
-            transaction_outputs: None,
-            account_states: None,
-        },
-    };
+    let summary = mock_storage_summary(200);
     response_sender.send(Ok(StorageServiceResponse::StorageServerSummary(summary)));
 
     // let the poller finish processing the response

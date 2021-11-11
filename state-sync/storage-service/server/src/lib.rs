@@ -316,20 +316,22 @@ impl StorageReaderInterface for StorageReader {
         let latest_ledger_info_with_sigs = self
             .storage
             .get_latest_ledger_info()
-            .map_err(|error| Error::StorageErrorEncountered(error.to_string()))?;
+            .map_err(|err| Error::StorageErrorEncountered(err.to_string()))?;
         let latest_ledger_info = latest_ledger_info_with_sigs.ledger_info();
-        let latest_epoch = latest_ledger_info.epoch();
-        let latest_version = latest_ledger_info.version();
+        let txn_range = CompleteDataRange::new(0, latest_ledger_info.version())
+            .map_err(|err| Error::StorageErrorEncountered(err.to_string()))?;
+        let epoch_range = CompleteDataRange::new(0, latest_ledger_info.epoch())
+            .map_err(|err| Error::StorageErrorEncountered(err.to_string()))?;
 
         // TODO(joshlind): Update the DiemDB to support fetching all of this data!
         // For now we assume everything (since genesis) is held.
         // Return the relevant data summary
         let data_summary = DataSummary {
             synced_ledger_info: Some(latest_ledger_info_with_sigs),
-            epoch_ending_ledger_infos: Some(CompleteDataRange::from_genesis(latest_epoch - 1)),
-            transactions: Some(CompleteDataRange::from_genesis(latest_version)),
-            transaction_outputs: Some(CompleteDataRange::from_genesis(latest_version)),
-            account_states: Some(CompleteDataRange::from_genesis(latest_version)),
+            epoch_ending_ledger_infos: Some(epoch_range),
+            transactions: Some(txn_range),
+            transaction_outputs: Some(txn_range),
+            account_states: Some(txn_range),
         };
 
         Ok(data_summary)
