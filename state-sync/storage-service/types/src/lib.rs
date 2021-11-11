@@ -14,7 +14,7 @@ use diem_types::{
         Version,
     },
 };
-use num_traits::identities::Zero;
+use num_traits::int::PrimInt;
 use serde::{de, Deserialize, Serialize};
 use thiserror::Error;
 
@@ -263,7 +263,7 @@ impl ProtocolMetadata {
 pub type Epoch = u64;
 
 /// A summary of the data actually held by the storage service instance.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DataSummary {
     /// The ledger info corresponding to the highest synced version in storage.
     /// This indicates the highest version and epoch that storage can prove.
@@ -286,9 +286,83 @@ pub struct DataSummary {
 }
 
 impl DataSummary {
-    pub fn can_service(&self, _request: &StorageServiceRequest) -> bool {
-        // TODO(philiphayes): fill out
-        true
+    pub fn can_service(&self, request: &StorageServiceRequest) -> bool {
+        use StorageServiceRequest::*;
+        match request {
+            // storage services can always serve these metadata requests
+            GetServerProtocolVersion => true,
+            GetStorageServerSummary => true,
+            GetAccountStatesChunkWithProof(request) => {
+                let proof_version = request.version;
+
+                let can_serve_accounts = self
+                    .account_states
+                    .map(|range| range.contains(request.version))
+                    .unwrap_or(false);
+
+                let can_create_proof = self
+                    .synced_ledger_info
+                    .as_ref()
+                    .map(|li| li.ledger_info().version() >= proof_version)
+                    .unwrap_or(false);
+
+                can_serve_accounts && can_create_proof
+            }
+            GetEpochEndingLedgerInfos(request) => {
+                let desired_range =
+                    match CompleteDataRange::new(request.start_epoch, request.expected_end_epoch) {
+                        Ok(desired_range) => desired_range,
+                        Err(_) => return false,
+                    };
+                self.epoch_ending_ledger_infos
+                    .map(|range| range.superset_of(&desired_range))
+                    .unwrap_or(false)
+            }
+            GetNumberOfAccountsAtVersion(version) => self
+                .account_states
+                .map(|range| range.contains(*version))
+                .unwrap_or(false),
+            GetTransactionOutputsWithProof(request) => {
+                let desired_range =
+                    match CompleteDataRange::new(request.start_version, request.end_version) {
+                        Ok(desired_range) => desired_range,
+                        Err(_) => return false,
+                    };
+
+                let can_serve_outputs = self
+                    .transaction_outputs
+                    .map(|range| range.superset_of(&desired_range))
+                    .unwrap_or(false);
+
+                let can_create_proof = self
+                    .synced_ledger_info
+                    .as_ref()
+                    .map(|li| li.ledger_info().version() >= request.proof_version)
+                    .unwrap_or(false);
+
+                can_serve_outputs && can_create_proof
+            }
+            GetTransactionsWithProof(request) => {
+                let desired_range =
+                    match CompleteDataRange::new(request.start_version, request.end_version) {
+                        Ok(desired_range) => desired_range,
+                        Err(_) => return false,
+                    };
+
+                let can_serve_txns = self
+                    .transactions
+                    .map(|range| range.superset_of(&desired_range))
+                    .unwrap_or(false);
+
+                let can_create_proof = self
+                    .synced_ledger_info
+                    .as_ref()
+                    .map(|li| li.ledger_info().version() >= request.proof_version)
+                    .unwrap_or(false);
+
+                can_serve_txns && can_create_proof
+            }
+        }
     }
 }
 
@@ -310,13 +384,31 @@ pub struct CompleteDataRange<T> {
     highest: T,
 }
 
-impl<T: Copy + Ord> CompleteDataRange<T> {
+impl<T: PrimInt> CompleteDataRange<T> {
     pub fn new(lowest: T, highest: T) -> Result<Self, DegenerateRangeError> {
         if lowest <= highest {
             Ok(Self { lowest, highest })
         } else {
             Err(DegenerateRangeError)
         }
+    }
+
+    pub fn from_genesis(highest: T) -> Self {
+        Self {
+            lowest: T::zero(),
+            highest,
+        }
+    }
+
+    /// Create a data range given the lower bound and the length of the range.
+    pub fn from_len(lowest: T, len: T) -> Result<Self, DegenerateRangeError> {
+        // highest = lowest + len - 1
+        // Note: the order of operations here is important
+        let highest = len
+            .checked_sub(&T::one())
+            .and_then(|addend| lowest.checked_add(&addend))
+            .ok_or(DegenerateRangeError)?;
+        Self::new(lowest, highest)
     }
 
     #[inline]
@@ -329,24 +421,20 @@ impl<T: Copy + Ord> CompleteDataRange<T> {
         self.highest
     }
 
-    /// Returns true iff the given data item is within this range
-    pub fn contains(&self, data_item: T) -> bool {
-        data_item >= self.lowest && data_item <= self.highest
+    /// Returns true iff the given item is within this range
+    pub fn contains(&self, item: T) -> bool {
+        self.lowest <= item && item <= self.highest
     }
-}
 
-impl<T: Zero> CompleteDataRange<T> {
-    pub fn from_genesis(highest: T) -> Self {
-        Self {
-            lowest: T::zero(),
-            highest,
-        }
+    /// Returns true iff this range is a superset of the other data range.
+    pub fn superset_of(&self, other: &Self) -> bool {
+        self.lowest <= other.lowest && other.highest <= self.highest
     }
 }
 
 impl<'de, T> de::Deserialize<'de> for CompleteDataRange<T>
 where
-    T: Copy + Ord + de::Deserialize<'de>,
+    T: PrimInt + de::Deserialize<'de>,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -363,5 +451,112 @@ where
 
         let value = Value::<T>::deserialize(deserializer)?;
         Self::new(value.lowest, value.highest).map_err(D::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diem_crypto::hash::HashValue;
+    use diem_types::{block_info::BlockInfo, ledger_info::LedgerInfo};
+    use std::collections::BTreeMap;
+
+    fn mock_ledger_info(version: Version) -> LedgerInfoWithSignatures {
+        LedgerInfoWithSignatures::new(
+            LedgerInfo::new(
+                BlockInfo::new(
+                    0,                 /* epoch */
+                    0,                 /* round */
+                    HashValue::zero(), /* id */
+                    HashValue::zero(), /* executed_state_id */
+                    version,           /* version */
+                    0,                 /* timestamp_usecs */
+                    None,              /* next_epoch_state */
+                ),
+                HashValue::zero(),
+            ),
+            BTreeMap::new(),
+        )
+    }
+
+    fn range(lowest: u64, highest: u64) -> CompleteDataRange<u64> {
+        CompleteDataRange::new(lowest, highest).unwrap()
+    }
+
+    fn get_epochs_request(start: Epoch, end: Epoch) -> StorageServiceRequest {
+        StorageServiceRequest::GetEpochEndingLedgerInfos(EpochEndingLedgerInfoRequest {
+            start_epoch: start,
+            expected_end_epoch: end,
+        })
+    }
+
+    fn get_txns_request(proof: Version, start: Version, end: Version) -> StorageServiceRequest {
+        StorageServiceRequest::GetTransactionsWithProof(TransactionsWithProofRequest {
+            proof_version: proof,
+            start_version: start,
+            end_version: end,
+            include_events: true,
+        })
+    }
+
+    #[test]
+    fn test_data_summary_can_service_epochs_request() {
+        let summary = DataSummary {
+            epoch_ending_ledger_infos: Some(range(100, 200)),
+            ..Default::default()
+        };
+
+        // in range, can service
+
+        assert!(summary.can_service(&get_epochs_request(100, 200)));
+        assert!(summary.can_service(&get_epochs_request(125, 175)));
+        assert!(summary.can_service(&get_epochs_request(100, 100)));
+        assert!(summary.can_service(&get_epochs_request(150, 150)));
+        assert!(summary.can_service(&get_epochs_request(200, 200)));
+
+        // out of range, can't service
+
+        assert!(!summary.can_service(&get_epochs_request(99, 200)));
+        assert!(!summary.can_service(&get_epochs_request(100, 201)));
+        assert!(!summary.can_service(&get_epochs_request(50, 250)));
+        assert!(!summary.can_service(&get_epochs_request(50, 150)));
+        assert!(!summary.can_service(&get_epochs_request(150, 250)));
+
+        // degenerate range, can't service
+
+        assert!(!summary.can_service(&get_epochs_request(150, 149)));
+    }
+
+    #[test]
+    fn test_data_summary_can_service_txns_request() {
+        let summary = DataSummary {
+            synced_ledger_info: Some(mock_ledger_info(250)),
+            transactions: Some(range(100, 200)),
+            ..Default::default()
+        };
+
+        // in range, can service
+
+        assert!(summary.can_service(&get_txns_request(225, 100, 200)));
+        assert!(summary.can_service(&get_txns_request(225, 125, 175)));
+        assert!(summary.can_service(&get_txns_request(225, 100, 100)));
+        assert!(summary.can_service(&get_txns_request(225, 150, 150)));
+        assert!(summary.can_service(&get_txns_request(225, 200, 200)));
+        assert!(summary.can_service(&get_txns_request(250, 200, 200)));
+
+        // out of range, can't service
+
+        assert!(!summary.can_service(&get_txns_request(225, 99, 200)));
+        assert!(!summary.can_service(&get_txns_request(225, 100, 201)));
+        assert!(!summary.can_service(&get_txns_request(225, 50, 250)));
+        assert!(!summary.can_service(&get_txns_request(225, 50, 150)));
+        assert!(!summary.can_service(&get_txns_request(225, 150, 250)));
+
+        assert!(!summary.can_service(&get_txns_request(300, 100, 200)));
+        assert!(!summary.can_service(&get_txns_request(300, 125, 175)));
+        assert!(!summary.can_service(&get_txns_request(300, 100, 100)));
+        assert!(!summary.can_service(&get_txns_request(300, 150, 150)));
+        assert!(!summary.can_service(&get_txns_request(300, 200, 200)));
+        assert!(!summary.can_service(&get_txns_request(251, 200, 200)));
     }
 }
