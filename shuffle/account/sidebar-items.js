@@ -1,0 +1,1 @@
+initSidebarItems({"fn":[["confirm_user_decision",""],["create_account_onchain",""],["create_local_accounts",""],["get_treasury_account",""],["handle",""]]});
